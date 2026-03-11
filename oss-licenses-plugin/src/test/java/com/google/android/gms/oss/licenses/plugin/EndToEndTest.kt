@@ -35,8 +35,12 @@ abstract class EndToEndTest(private val agpVersion: String, private val gradleVe
     private lateinit var projectDir: File
 
     private fun createRunner(vararg arguments: String): GradleRunner {
+        return createRunnerWithDir(projectDir, *arguments)
+    }
+
+    private fun createRunnerWithDir(dir: File, vararg arguments: String): GradleRunner {
         return GradleRunner.create()
-            .withProjectDir(projectDir)
+            .withProjectDir(dir)
             .withGradleVersion(gradleVersion)
             .forwardOutput()
             // Isolate TestKit per AGP version subclass to allow parallel execution
@@ -49,7 +53,11 @@ abstract class EndToEndTest(private val agpVersion: String, private val gradleVe
     @Before
     fun setup() {
         projectDir = tempDirectory.newFolder("basic")
-        File(projectDir, "build.gradle").writeText(
+        setupProject(projectDir)
+    }
+
+    private fun setupProject(dir: File) {
+        File(dir, "build.gradle").writeText(
             """
             plugins {
                 id("com.android.application") version "$agpVersion"
@@ -68,13 +76,13 @@ abstract class EndToEndTest(private val agpVersion: String, private val gradleVe
             }
         """.trimIndent()
         )
-        File(projectDir, "gradle.properties").writeText(
+        File(dir, "gradle.properties").writeText(
             """
             android.useAndroidX=true
             com.google.protobuf.use_unsafe_pre22_gencode=true
         """.trimIndent()
         )
-        File(projectDir, "settings.gradle").writeText(
+        File(dir, "settings.gradle").writeText(
             """
             pluginManagement {
                 repositories {
@@ -192,16 +200,72 @@ abstract class EndToEndTest(private val agpVersion: String, private val gradleVe
         // Gson 2.8.9 specifically uses the Apache 2.0 license URL.
         Assert.assertTrue(content.contains("apache.org/licenses/LICENSE-2.0"))
     }
+
+    @Test
+    fun testRelocatability() {
+        val cacheDir = tempDirectory.newFolder("cache")
+        val dir1 = tempDirectory.newFolder("dir1")
+        val dir2 = tempDirectory.newFolder("dir2")
+
+        // Helper to populate a directory with the test project
+        fun populate(dir: File) {
+            // ONLY copy the source files, NEVER the build outputs or local cache state
+            projectDir.listFiles()?.forEach { file ->
+                if (file.name != "build" && file.name != ".gradle") {
+                    file.copyRecursively(File(dir, file.name), overwrite = true)
+                }
+            }
+
+            // Update the settings.gradle to point to the correct repo path in the new location
+            File(dir, "settings.gradle").writeText(
+                """
+                pluginManagement {
+                    repositories {
+                        maven {
+                             url = uri("${System.getProperty("repo_path")}")
+                        }
+                        google()
+                        mavenCentral()
+                    }
+                }
+
+                buildCache {
+                    local {
+                        directory = '${cacheDir.absolutePath.replace("\\", "/")}'
+                    }
+                }
+                """.trimIndent()
+            )
+        }
+        populate(dir1)
+        populate(dir2)
+
+        // 1. Run in dir1 to prime the cache
+        val result1 = createRunnerWithDir(dir1, "releaseOssLicensesTask", "--build-cache").build()
+        Assert.assertEquals(TaskOutcome.SUCCESS, result1.task(":releaseOssLicensesTask")?.outcome)
+
+        // 2. Run in dir2 (different absolute path) and expect FROM-CACHE
+        val result2 = createRunnerWithDir(dir2, "releaseOssLicensesTask", "--build-cache").build()
+
+        Assert.assertEquals(
+            "LicensesTask should be relocatable",
+            TaskOutcome.FROM_CACHE,
+            result2.task(":releaseOssLicensesTask")?.outcome
+        )
+        Assert.assertEquals(
+            "DependencyTask should be relocatable",
+            TaskOutcome.FROM_CACHE,
+            result2.task(":releaseOssDependencyTask")?.outcome
+        )
+    }
 }
 
-class EndToEndTest_AGP74_G75 : EndToEndTest("7.4.2", "7.5")
-class EndToEndTest_AGP80_G80 : EndToEndTest("8.0.0", "8.0")
-class EndToEndTest_AGP82_G82 : EndToEndTest("8.2.0", "8.2")
-class EndToEndTest_AGP87_G89 : EndToEndTest("8.7.0", "8.9")
-class EndToEndTest_AGP810_G811 : EndToEndTest("8.10.0", "8.11.1")
-class EndToEndTest_AGP812_G814 : EndToEndTest("8.12.2", "8.14")
-class EndToEndTest_AGP90_G90 : EndToEndTest("9.0.0-alpha03", "9.0.0")
-class EndToEndTest_AGP91_G931 : EndToEndTest("9.1.0-alpha05", "9.3.1")
+class EndToEndTest_AGP74_G75 : EndToEndTest("7.4.2", "7.5.1")
+class EndToEndTest_AGP80_G80 : EndToEndTest("8.0.2", "8.0.2")
+class EndToEndTest_AGP87_G89 : EndToEndTest("8.7.3", "8.9")
+class EndToEndTest_AGP812_G814 : EndToEndTest("8.12.2", "8.14.1")
+class EndToEndTest_AGP_STABLE_90_G90 : EndToEndTest("9.0.1", "9.1.0")
+class EndToEndTest_AGP_ALPHA_92_G94 : EndToEndTest("9.2.0-alpha02", "9.4.0")
 
 private fun expectedDependenciesJson(builtInKotlinEnabled: Boolean, agpVersion: String) = """[
     {
@@ -382,7 +446,7 @@ private fun expectedDependenciesJson(builtInKotlinEnabled: Boolean, agpVersion: 
     {
         "group": "org.jetbrains.kotlin",
         "name": "kotlin-stdlib",
-        "version": "${if (agpVersion.startsWith("9.1")) "2.2.10" else "2.2.0"}"""" else ""}
+        "version": "${if (agpVersion.startsWith("9"))"2.2.10" else "2.2.0"}"""" else ""}
     }
 ]"""
 
